@@ -190,9 +190,14 @@ int main(int argc, char *argv[])
    drive_params.cmdline = msg_malloc(strlen(cmdline)+1,"main cmdline");
    strcpy(drive_params.cmdline, cmdline);
 
+   int dac_servo_mode = 1; // TODO: Add to parse_cmdline (refactor to be a property of drive_params)
    if (read) {
+
+      if (dac_servo_mode)
+         printf("DAC servo head-pulling recovery-mode enabled\n");
+
       drive_setup(&drive_params);
-      drive_read_disk(&drive_params, deltas, max_deltas);
+      drive_read_disk(&drive_params, deltas, max_deltas,dac_servo_mode);
    }
 
    pru_exec_cmd(CMD_EXIT, 0);

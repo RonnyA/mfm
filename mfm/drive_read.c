@@ -54,20 +54,55 @@
 #include "drive.h"
 #include "board.h"
 
+#include "mcp4725.h"
+
+// For creating emulator file you may want to set this to 1 since emulator
+// file not always good if data recovered from multiple reads. For creating
+// extracted data file 0 is better.
+#define SINGLE_READ_GOOD 0
+
+// 1 if you don't want the drive trying to seek to the correct track when it
+// finds the wrong cylinder
+#define DISABLE_OFFTRACK_SEEK 0
+
+// Maximum voltage DAC can generate. 0 is minumum
+#define DAC_FULL_SCALE 11.4
+// Maximum voltage to use for retries
+// 6.0 for RD53/Micropolis 1325 with 50k resistor to U31 pin 2
+// 6.0 for RD54/Maxtor XT-2190 with 10k resistor U14 pin 13
+// 6.0 for Miniscribe 6085 with 10k resistor to U6 pin 9
+#define MAX_DAC 6.0
+// Minimum voltage to use for retries
+// 5.0 for RD53/Micropolis 1325 with 50k resistor
+// 3.5 for RD54/Maxtor XT-2190 with 10k resistor
+// 5.0 for Miniscribe 6085 with 10k resistor
+#define MIN_DAC 5.0
+// Nominal DAC voltage (head centered on track)
+// 5.5 for RD53/Micropolis 1325 with 50k resistor
+// 5.0 for RD54/Maxtor XT-2190 with 10k resistor
+// 5.5 for Miniscribe 6085
+#define NOMINAL_DAC 5.5
+// Convert voltage to DAC binary value
+#define DAC_COUNT(x) round(4095 * x / DAC_FULL_SCALE)
+
+// Simple old * FILTER + new * (1-FILTER) filter
+#define FILTER .9 
+
+
 // Read the disk.
 //  drive params specifies the information needed to decode the drive and what
 //    files should be written from the data read
 //
 // drive_params: Drive parameters
 // deltas: Memory array containing the raw MFM delta time transition data
-void drive_read_disk(DRIVE_PARAMS *drive_params, void *deltas, int max_deltas)
-{
+void drive_read_disk(DRIVE_PARAMS *drive_params, void *deltas, int max_deltas, int dac_servo_mode)
+{   
    // Loop variable
    int cyl, head;
    int cntr;
    // Retry counter, counts up
    int err_cnt;
-   // No seek retry counter, counts down
+      // No seek retry counter, counts down
    int no_seek_count;
    // Read status
    SECTOR_DECODE_STATUS sector_status = 0;
@@ -92,17 +127,42 @@ void drive_read_disk(DRIVE_PARAMS *drive_params, void *deltas, int max_deltas)
    int count = 0;
    int recovery_active = 0;
 
+
+   int last_good = 0;
+
+   // Voltage to start with for each head
+   float head_dac[MAX_HEAD];
+   // zero step to lower voltage
+   int head_dir[MAX_HEAD];
+   float cur_dac=NOMINAL_DAC;
+
+   if (dac_servo_mode)
+   {
+      mcp4725_open();
+      // Disable DAC output
+      mcp4725_disable_dac(1);
+
+      for (cntr = 0; cntr < MAX_HEAD; cntr++) {
+         head_dac[cntr] = NOMINAL_DAC;
+         head_dir[cntr] = 1;
+      }
+   }
+
+
    // Start up delta reader
    deltas_start_thread(drive_params);
 
    mfm_decode_setup(drive_params, 1);
-
+   
    for (cyl = 0; cyl < drive_params->num_cyl; cyl++) {
       if (cyl % 5 == 0)
          msg(MSG_PROGRESS, "At cyl %d\r", cyl);
       for (head = 0; head < drive_params->num_head; head++) {
          int recovered = 0;
          int retries;
+
+         if (dac_servo_mode)
+            cur_dac = head_dac[head];
 
          err_cnt = 0;
          no_seek_count = drive_params->no_seek_retries;
@@ -117,50 +177,59 @@ void drive_read_disk(DRIVE_PARAMS *drive_params, void *deltas, int max_deltas)
             retries = drive_params->retries;
          }
          do {
-            // First error retry without seek, second with third without etc
-            // Hopefully by moving head it will settle slightly differently
-            // allowing data to be read
-            if (no_seek_count <= 0) {
-               int clip_seek_len = seek_len;
-
-               // In recovery mode the drive will perform a microstep instead
-               // of a full cylinder step. The sequency of microsteps positions
-               // will repeat after a drive dependent number of steps
-               if (drive_params->recovery) {
-                  if (!recovery_active) {
-                     drive_enable_recovery(1);
-                     recovery_active = 1;
-                  }
-                  drive_step(drive_params->step_speed, 1, 
-                     DRIVE_STEP_NO_UPDATE_CYL, DRIVE_STEP_FATAL_ERR);
-               } else {
-                  if (cyl + seek_len >= drive_params->num_cyl) {
-                     clip_seek_len = drive_params->num_cyl - cyl - 1;
-                  }
-                  if (cyl + seek_len < 0) {
-                     clip_seek_len = -cyl;
-                  }
-                  //printf("seeking %d %d %d\n",err_cnt, seek_len, seek_len + cyl);
-                  if (clip_seek_len != 0) {
-                     drive_step(drive_params->step_speed, clip_seek_len, 
-                        DRIVE_STEP_UPDATE_CYL, DRIVE_STEP_FATAL_ERR);
-                     drive_step(drive_params->step_speed, -clip_seek_len, 
-                        DRIVE_STEP_UPDATE_CYL, DRIVE_STEP_FATAL_ERR);
-                  }
-                  if (seek_len < 0) {
-                     seek_len = seek_len * 2;
-                     if (seek_len <= -drive_params->num_cyl) {
-                        seek_len = -1;
+            if (dac_servo_mode)
+            {
+               mcp4725_set_dac(DAC_COUNT(cur_dac), MCP4725_PD_NONE, 0);
+               printf("Setting DAC to %.2f cyl %d head %d last good %d\n",cur_dac, cyl, head, last_good);
+            }
+            else
+            {
+               // First error retry without seek, second with third without etc
+               // Hopefully by moving head it will settle slightly differently
+               // allowing data to be read
+               if (no_seek_count <= 0) {
+                  int clip_seek_len = seek_len;
+   
+                  // In recovery mode the drive will perform a microstep instead
+                  // of a full cylinder step. The sequency of microsteps positions
+                  // will repeat after a drive dependent number of steps
+                  if (drive_params->recovery) {
+                     if (!recovery_active) {
+                        drive_enable_recovery(1);
+                        recovery_active = 1;
+                     }
+                     drive_step(drive_params->step_speed, 1, 
+                        DRIVE_STEP_NO_UPDATE_CYL, DRIVE_STEP_FATAL_ERR);
+                  } else {
+                     if (cyl + seek_len >= drive_params->num_cyl) {
+                        clip_seek_len = drive_params->num_cyl - cyl - 1;
+                     }
+                     if (cyl + seek_len < 0) {
+                        clip_seek_len = -cyl;
+                     }
+                     //printf("seeking %d %d %d\n",err_cnt, seek_len, seek_len + cyl);
+                     if (clip_seek_len != 0) {
+                        drive_step(drive_params->step_speed, clip_seek_len, 
+                           DRIVE_STEP_UPDATE_CYL, DRIVE_STEP_FATAL_ERR);
+                        drive_step(drive_params->step_speed, -clip_seek_len, 
+                           DRIVE_STEP_UPDATE_CYL, DRIVE_STEP_FATAL_ERR);
+                     }
+                     if (seek_len < 0) {
+                        seek_len = seek_len * 2;
+                        if (seek_len <= -drive_params->num_cyl) {
+                           seek_len = -1;
+                        }
+                     }
+                     seek_len = -seek_len;
+                     if (seek_len == 0) {
+                        seek_len = 1;
                      }
                   }
-                  seek_len = -seek_len;
-                  if (seek_len == 0) {
-                     seek_len = 1;
-                  }
+                  no_seek_count = drive_params->no_seek_retries;
                }
-               no_seek_count = drive_params->no_seek_retries;
+               no_seek_count--;
             }
-            no_seek_count--;
+
             clock_gettime(CLOCK, &tv_start);
             start = tv_start.tv_sec + tv_start.tv_nsec / 1e9;
             if (last != 0) {
@@ -177,7 +246,10 @@ void drive_read_disk(DRIVE_PARAMS *drive_params, void *deltas, int max_deltas)
             }
             last = start;
 
-            drive_read_track(drive_params, cyl, head, deltas, max_deltas, 0);
+            drive_read_track(drive_params, cyl, head, deltas, max_deltas,0); // int dac_servo_mode
+            
+            if (dac_servo_mode)
+               mfm_init_sector_status_list(sector_status_list, drive_params->num_sectors);
 
             sector_status = mfm_decode_track(drive_params, cyl, head,
                deltas, &seek_difference, sector_status_list);
@@ -187,29 +259,99 @@ void drive_read_disk(DRIVE_PARAMS *drive_params, void *deltas, int max_deltas)
             // even if the last read had errors we may have recovered all the
             // data without errors.
             sect_err = 0;
+
+            if (dac_servo_mode)
+               last_good = 0;
+      
             for (cntr = 0; cntr < drive_params->num_sectors; cntr++) {
                if (UNRECOVERED_ERROR(sector_status_list[cntr].status)) {
                   sect_err = 1;
+               } 
+               else if (dac_servo_mode) {
+                  last_good++;
                }
+            }
+            if (!sect_err) {
+     //          msg(MSG_INFO, "Good multiple read cyl %d head %d\n", cyl, head);
+            }
+
+            if (dac_servo_mode)
+               {
+               // Try to get single read without error
+ #if SINGLE_READ_GOOD
+               if (sector_status & (SECT_BAD_HEADER | SECT_BAD_DATA)) {
+                  sect_err = 1;
+               }
+ #endif
             }
             // Looks like a seek error. Sector headers which don't have the
             // expected cylinder such as when tracks are spared can trigger
             // this also
-            if (sector_status & SECT_WRONG_CYL) {
+            if ((sector_status & SECT_WRONG_CYL)) {
+               if (dac_servo_mode)
+               {
+               //if ((sector_status & SECT_WRONG_CYL) && seek_difference > 1) {
+               //if ((sector_status & SECT_WRONG_CYL) && (seek_difference > 1 || new_track)) {
+                  if (drive_at_track0()) {
+                     printf("At track0 seek err\n");
+                     seek_difference = cyl;
+                  }
+               }
+#if DISABLE_OFFTRACK_SEEK
                if (err_cnt < retries) {
                   msg(MSG_ERR, "Retrying seek cyl %d, cyl off by %d\n", cyl,
                         seek_difference);
+
+                  if (dac_servo_mode)
+                  {
+                     // Disable DAC output
+                     mcp4725_disable_dac(1);
+                     usleep(10); // Allow lines to settle
+                  }
+                  // Retry seek
                   drive_step(drive_params->step_speed, seek_difference, 
                      DRIVE_STEP_NO_UPDATE_CYL, DRIVE_STEP_FATAL_ERR);
+                  
+                  if (dac_servo_mode)
+                  {
+                     printf("Step done\n");
+                     //sleep(2);
+                     mcp4725_disable_dac(0);
+                     printf("DAC set back to %f\n", cur_dac);
+                     //sleep(2);
+                  }
                }
+#endif
             }
 
             if (UNRECOVERED_ERROR(sector_status) && !sect_err) {
                recovered = 1;
             }
+
+            if (dac_servo_mode)
+            {
+               if (sect_err) {
+                  if (head_dir[head]) { 
+                     cur_dac += (MAX_DAC - NOMINAL_DAC) / retries * 2;
+                     if (cur_dac > MAX_DAC) {
+                        cur_dac = NOMINAL_DAC;
+                        head_dir[head] = 0;
+                     }
+                  } else {
+                     cur_dac -= (NOMINAL_DAC - MIN_DAC) / retries * 2;
+                     if (cur_dac < MIN_DAC) {
+                        cur_dac = NOMINAL_DAC;
+                        head_dir[head] = 1;
+                     }
+                  }
+               } else {
+                  head_dac[head] = head_dac[head] * FILTER + cur_dac * (1.0 - FILTER);
+               }
+            }
+
          // repeat until we get all the data or run out of retries
          } while (sect_err && err_cnt++ < retries);
-         if (recovery_active) {
+                  if (recovery_active) {
            drive_enable_recovery(0);
            // My ST225 doesn't follow the manual behavior of inactivating seek
            // complete after recovery goes inactive while it repositions the 
@@ -242,6 +384,9 @@ void drive_read_disk(DRIVE_PARAMS *drive_params, void *deltas, int max_deltas)
 
    deltas_stop_thread();
 
+   if (dac_servo_mode)
+      mcp4725_close();
+
    return;
 }
 
@@ -257,12 +402,27 @@ void drive_read_disk(DRIVE_PARAMS *drive_params, void *deltas, int max_deltas)
 //
 // return non zero if write fault present and return_write_fault true.
 int drive_read_track(DRIVE_PARAMS *drive_params, int cyl, int head, 
-      void *deltas, int max_deltas, int return_write_fault) {
+      void *deltas, int max_deltas, int return_write_fault) { //},int dac_servo_mode ) { 
+   
+   int dac_servo_mode = 1;
 
    if (cyl != drive_current_cyl()) {
+      if (dac_servo_mode)
+      {
+         // Disable DAC output
+         mcp4725_disable_dac(1);
+         usleep(10); // Allow lines to settle
+         printf("Stepping cyl %d cur %d\n", cyl, drive_current_cyl());
+      }
+      
       drive_step(drive_params->step_speed, cyl - drive_current_cyl(), 
          DRIVE_STEP_UPDATE_CYL, DRIVE_STEP_FATAL_ERR);
    }
+
+
+   // Reenable DAC output
+   if (dac_servo_mode)
+      mcp4725_disable_dac(0);
 
       // Analyze can change so set it every time
    pru_write_word(MEM_PRU0_DATA, PRU0_START_TIME_CLOCKS,

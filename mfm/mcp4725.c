@@ -20,7 +20,7 @@ static int file;
 // Open and configure the i2c interface
 void mcp4725_open()
 {
-  file = open("/dev/i2c-1", O_RDWR);
+  file = open("/dev/i2c-2", O_RDWR);
   if (file < 0) {
     /* ERROR HANDLING; you can check errno to see what went wrong */
     exit(1);
@@ -50,9 +50,15 @@ void mcp4725_set_dac(int value, int powerdown, int set_eeprom)
       buf[0] = 0x60 | (powerdown << 1); // Write to DAC register and EEPROM
       buf[1] = value >> 4;
       buf[2] = value << 4;
-      if ((rc = write(file, buf, sizeof(buf))) != sizeof(buf)) {
+      if ((rc = write(file, buf, sizeof(buf))) != sizeof(buf)) {        
         /* ERROR HANDLING: i2c transaction failed */
-        printf("error, wrote %d bytes\n",rc); 
+        if (rc == -1) {
+            // Print the error message using perror
+            perror("Failed to write to the I2C device");
+        } else {
+         printf("DAC error #1, wrote %d bytes\n",rc); 
+        }
+
         exit(1);
       } 
    } else {
@@ -62,7 +68,12 @@ void mcp4725_set_dac(int value, int powerdown, int set_eeprom)
       buf[1] = value;
       if ((rc = write(file, buf, sizeof(buf))) != sizeof(buf)) {
         /* ERROR HANDLING: i2c transaction failed */
-        printf("error, wrote %d bytes\n",rc); 
+        if (rc == -1) {
+            // Print the error message using perror
+            perror("Failed to write to the I2C device");
+        } else {
+           printf("DAC error #2, wrote %d bytes\n",rc); 
+        }
         exit(1);
       } 
    }
@@ -79,8 +90,13 @@ void mcp4725_get_status(int *value, int *eeprom_value, int *pd,
 
    /* Using I2C Read, equivalent of i2c_smbus_read_byte(file) */
    if ((rc = read(file, buf, sizeof(buf))) != sizeof(buf)) {
-     /* ERROR HANDLING: i2c transaction failed */
-     printf("error, read %d bytes\n",rc); 
+     /* ERROR HANDLING: i2c transaction failed */             
+      if (rc == -1) {
+         // Print the error message using perror
+         perror("Failed to write to the I2C device");
+      } else {
+         printf("DAC error #3, read %d bytes\n",rc); 
+      }
      exit(1);
    }
    if (value != NULL)
