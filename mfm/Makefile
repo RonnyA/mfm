@@ -21,7 +21,7 @@ SOURCES =  mfm_read.c mfm_decoder.c wd_mfm_decoder.c xebec_mfm_decoder.c \
 	crc_ecc.c pru_setup.c msg.c parse_cmdline.c analyze.c \
 	deltas_read.c drive.c emu_tran_file.c corvus_mfm_decoder.c \
 	northstar_mfm_decoder.c board.c drive_read.c tagged_mfm_decoder.c \
-        perq_mfm_decoder.c
+        perq_mfm_decoder.c mcp4725.c
 OBJECTS = $(addprefix $(OBJDIR)/, $(SOURCES:.c=.o))
 SOURCES2 =  mfm_util.c mfm_decoder.c wd_mfm_decoder.c xebec_mfm_decoder.c \
 	crc_ecc.c msg.c parse_cmdline.c emu_tran_file.c corvus_mfm_decoder.c \
